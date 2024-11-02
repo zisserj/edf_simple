@@ -1,7 +1,7 @@
 
 import numpy as np
 from scipy.stats import expon
-from v3_obj import *
+from v4_obj import *
 
 in_oper_f_r = 10e-4  # per hour (exp)
 on_demand_f_r = 10e-2  # per attempt
@@ -16,6 +16,8 @@ lines = [[c for c in l] for l in [comps[:2], comps[::2]]]
 #t_c = line[0]
 
 
+context = {'c': {c: Status.OFF for c in comps},
+           'l': {l: Status.OFF for l in l_names}}
 
 def c_event(c, e_name, t=0):
     if t > 0:
@@ -25,6 +27,7 @@ l_event = lambda l, e_name: E(e_name, data={'l': l})
 ls_set = lambda ls: EventSet(lambda e: e.data.get('l') in ls)
 c_set = lambda c: EventSet(lambda e: e.data.get('c') == c)
 t_passed = EventSet(lambda e: isinstance(e, TEvent) and e.t > 0)
+
 
 '''Random failure during operation'''
 @bp.thread
@@ -45,17 +48,6 @@ def component_repair(c, repair_scale):
         yield sync(request=c_event(c, 'repaired', expon.rvs(scale=repair_scale)),
                    block=[c_event(c, n) for n in ['o_fail', 'on', 'off']])
 
-# @bp.thread
-# def component_status(c, status=Status.OFF):
-#   while True:
-#     blocked_events = []
-#     e = yield sync(waitFor=[c_event(c, n) for n in ['on', 'off', 'repaired', 'o_fail', 'd_fail']])
-#     if e.name in ['on']:
-#       status = Status.ON
-#     elif e.name in ['off', 'repaired']
-#       status = Status.OFF
-#     else:
-#       status = Status.BROKEN
 
 '''Induce potential failure on demand'''
 @bp.thread
@@ -76,46 +68,32 @@ def restart_component(c):
         yield sync(waitFor=c_event(c, 'repaired'))
         yield sync(request=c_event(c, 'req_on', 10))
 
-'''Keeps track of inidividual line components'''
+'''updates line status according to component events'''
 @bp.thread
-def line_status(
-        name,
-        line_comps,
-        status=Status.OFF):  # initial status can technically be inferred
-    cs_status = {c: Status.OFF for c in line_comps}
+def line_status(name, line_comps):
     while True:
-        line_events = EventSet(lambda e: e.data.get('c') in cs_status.keys()
+        line_events = EventSet(lambda e: e.data.get('c') in line_comps
                     and e.name in ['on', 'off', 'repaired', 'o_fail', 'd_fail'])
         e = yield sync(waitFor=line_events)
-        c = e.data['c']
-        if e.name in ['o_fail', 'd_fail']:
-            cs_status[c] = Status.BROKEN
-            if status != Status.BROKEN:
-                status = Status.BROKEN
-                yield sync(request=l_event(name, 'line_fail'),
-                           block=line_events)
-        elif e.name == 'off':
-            cs_status[c] = Status.OFF
-            if status == Status.ON:
-                status = Status.OFF
-                yield sync(request=l_event(name, 'line_off'),
-                           block=line_events)
+        current_status = context['l'][name]
+        update_event = False
+        if e.name in ['o_fail', 'd_fail'] and current_status != Status.BROKEN:
+            update_event = 'line_fail'
+        elif e.name == 'off' and current_status == Status.ON:
+            update_event = 'line_off'
         elif e.name == 'repaired':
-            cs_status[c] = Status.OFF
-            if not Status.BROKEN in cs_status.values():
-                status = Status.OFF
-                yield sync(request=l_event(name, 'line_operational'),
-                           block=line_events)
+            if not Status.BROKEN in [context['c'][line_c] for line_c in line_comps]:
+                update_event == 'line_operational'
         elif e.name == 'on':
-            cs_status[c] = Status.ON
-            if all([s == Status.ON for s in cs_status.values()]):
-                status = Status.ON
-                yield sync(request=l_event(name, 'line_on'), block=line_events)
-
+            if all([context['c'][line_c] == Status.ON for line_c in line_comps]):
+                update_event = 'line_on'
+        if update_event:
+            yield sync(request=l_event(name, update_event),
+                           block=line_events)
 
 '''Restarts line after its repaired'''
 @bp.thread
-def restart_line(name, line_comps):  # need just names here
+def restart_line(name, line_comps): 
     while True:
         yield sync(waitFor=l_event(name, 'line_operational'))
         for c in line_comps:
@@ -140,10 +118,10 @@ def disable_line_on_fail(name, line_comps):
 
 '''Stops line on request'''
 @bp.thread
-def stop_line(name, cs_status):
+def stop_line(name, line_comps):
     while True:
         yield sync(waitFor=l_event(name, 'line_req_off'))
-        for c in cs_status.keys():
+        for c in line_comps:
             yield sync(request=c_event(c, 'req_off'))
 
 def find_next_functional(status, start, ascending=True):
@@ -155,11 +133,15 @@ def find_next_functional(status, start, ascending=True):
             return -1
     return idx
 
-'''Prioritizes starting the first functioning line'''
+@bp.thread
+def init_line_one(lines_names):
+    yield sync(request=l_event(lines_names[0], 'line_req_on'))
+
+'''(WIP) Prioritizes starting the first functioning line'''
 @bp.thread
 def line_manager(lines_names):
     current_use = 0
-    status = [Status.OFF for l in lines_names]
+    status = context['l']
     force_next = lambda e_name: {'request': E(e_name), 'block': AllExcept(E(e_name))} 
     # turn on first line at start
     yield sync(request=l_event(lines_names[current_use], 'line_req_on'))
@@ -188,39 +170,54 @@ def line_manager(lines_names):
                 current_use = idx
 
 
-'''
-if line was on and component breaks:
-  announce line malfunction v
-  turn off non-shared v
-  if fails:
-    short-circuit
-'''
-
+'''(for testing) starts a single component'''
 @bp.thread
 def start(c):
     yield sync(request=c_event(c, 'req_on'))
 
 
+def context_effect(current, event):
+    comp_updates = [(['o_fail', 'd_fail'], Status.BROKEN),
+                    (['off', 'repaired'], Status.OFF),
+                    (['on'], Status.ON)]
+    line_updates = [(['line_fail'], Status.BROKEN),
+                    (['line_off', 'line_operational'], Status.OFF),
+                    (['line_on'], Status.ON)]
+    if event.data.get('c'):
+        for events, status in comp_updates:
+            if event.name in events:
+                current['c'][event.data['c']] = status
+                print(f'{event.data["c"]} <- {status}')
+    elif event.data.get('l'):
+        for events, status in line_updates:
+            if event.name in events:
+                current['l'][event.data['l']] = status
+                print(f'{event.data["l"]} <- {status}')
 
 
 bt_c_params = {
     component_decay: [1 / in_oper_f_r],
     component_repair: [1 / repair_rate],
-    component_toggle: [on_demand_f_r],
+    component_toggle: [1/3],
     #restart_component: [],
     #start: []
 }
 
 l_bthreads = [
     bt(lname, lcomp) for bt, (lname, lcomp) in itertools.product(
-            [line_status, restart_line, disable_line_on_fail, start_line],
+            [line_status,
+             restart_line,
+             disable_line_on_fail,
+             start_line],
             zip(l_names, lines))
 ]
 c_bthreads = [
     bt(c, *params)
     for c, (bt, params) in itertools.product(comps, bt_c_params.items())
 ]
-prog = bp.BProgram(bthreads=c_bthreads + l_bthreads + [line_manager(l_names)],
-                   listener=bp.PrintBProgramRunnerListener(),
-                   event_selection_strategy=AlarmEventSelection(max_time=250))
+prog = ContextualBProgram(context=context,
+                          effect=context_effect,
+                          bthreads=c_bthreads + l_bthreads + [init_line_one(l_names)],
+                          listener=bp.PrintBProgramRunnerListener(),
+                          event_selection_strategy=AlarmEventSelection(max_time=300),)
 prog.run()
