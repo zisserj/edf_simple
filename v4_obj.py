@@ -134,6 +134,8 @@ class ContextualBProgram(bp.BProgram):
         
     def next_event(self):
         e = super().next_event()
-        if e: # dont wan't to throw exceptions at the program end
-            self.effect(self.context, e)
+        if e: # dont wan't to throw exceptions at the end
+            if self.effect(self.context, e): # if context changed
+                #queries()
+                pass
         return e

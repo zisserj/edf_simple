@@ -176,6 +176,8 @@ def start(c):
     yield sync(request=c_event(c, 'req_on'))
 
 
+'''updates current context according to selected event.
+returns true if an update occured, false otherwise (potentially unnecessary)'''
 def context_effect(current, event):
     comp_updates = [(['o_fail', 'd_fail'], Status.BROKEN),
                     (['off', 'repaired'], Status.OFF),
@@ -188,12 +190,18 @@ def context_effect(current, event):
             if event.name in events:
                 current['c'][event.data['c']] = status
                 print(f'{event.data["c"]} <- {status}')
+                return True
     elif event.data.get('l'):
         for events, status in line_updates:
             if event.name in events:
                 current['l'][event.data['l']] = status
                 print(f'{event.data["l"]} <- {status}')
+                return True
+    return False
 
+
+def queryctx():
+    pass
 
 bt_c_params = {
     component_decay: [1 / in_oper_f_r],
@@ -219,5 +227,5 @@ prog = ContextualBProgram(context=context,
                           effect=context_effect,
                           bthreads=c_bthreads + l_bthreads + [init_line_one(l_names)],
                           listener=bp.PrintBProgramRunnerListener(),
-                          event_selection_strategy=AlarmEventSelection(max_time=300),)
+                          event_selection_strategy=AlarmEventSelection(max_time=300))
 prog.run()
